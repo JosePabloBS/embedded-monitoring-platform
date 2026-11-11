@@ -7,6 +7,8 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* =====================================================================
  * I2C address
@@ -30,6 +32,7 @@
 #define BME280_REG_STATUS           0xF3
 #define BME280_REG_CTRL_MEAS        0xF4
 #define BME280_REG_CONFIG           0xF5
+#define BME280_RESET_CMD            0xB6
 
 /* --- Raw data (0xF7..0xFE): press(3) + temp(3) + hum(2) --- */
 #define BME280_REG_DATA             0xF7
@@ -99,6 +102,10 @@ static int8_t dig_H6;
  * compensation routines. Defined as global by Bosch's algorithm. */
 static int32_t t_fine;
 
+/* Variables for tracking consecutive identical readings */
+static uint8_t s_last_raw[BME280_DATA_LEN];
+static int s_same_raw_count = 0;
+static bool s_last_valid = false; /* Indicates if s_last_raw_data contains valid data */
 
 /* =====================================================================
  * I2C helpers
@@ -120,6 +127,15 @@ static esp_err_t bme280_write_register(uint8_t reg, uint8_t value)
     return i2c_master_transmit(s_bme280, buffer, sizeof(buffer), -1);
 }
 
+/**
+ * @brief Check if the sensor is stuck at the same reading.
+ * 
+ * @return true if the sensor has returned the same raw reading for 
+ * BME280_STUCK_THRESHOLD consecutive reads, otherwise false.
+ */
+bool bme280_is_stuck(void){
+    return s_same_raw_count >= BME280_STUCK_THRESHOLD;
+}
 
 /* =====================================================================
  * Calibration readout
@@ -173,9 +189,11 @@ static esp_err_t bme280_read_calibration_tph1(void)
 }
 
 /**
- * @brief Read the humidity calibration block 0xE1..0xE7 (7 bytes) and unpack dig_H2..H6.
+ * @brief Read the humidity calibration block 0xE1..0xE7 (7 bytes)
+ * and unpack dig_H2..H6.
  * 
- * dig_H4 and dig_H5 are 12-bit signed values split across two registers (0xE4/0xE5 and 0xE5/0xE6). Sign-extension from bit 11 is required.
+ * dig_H4 and dig_H5 are 12-bit signed values split across two registers 
+ * (0xE4/0xE5 and 0xE5/0xE6). Sign-extension from bit 11 is required.
  * 
  * @return esp_err_t 
  */
@@ -339,6 +357,25 @@ esp_err_t bme280_init(void)
     }
     ESP_LOGI(TAG, "BME280 detected (chip ID 0x%02X)", chip_id);
 
+    /* 2.5) Soft reset: write 0xB6 to the RESET register (0xE0) */
+    err = bme280_write_register(BME280_REG_RESET, BME280_RESET_CMD);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send soft reset: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Wait for the sensor to complete its internal reset.
+    * The datasheet specifies a startup time of ~2 ms, but give it margin. */
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Verify chip ID again after reset */
+    uint8_t chip_id_after = 0;
+    err = bme280_read_registers(BME280_REG_ID, &chip_id_after, 1);
+    if (err != ESP_OK || chip_id_after != BME280_CHIP_ID) {
+        ESP_LOGE(TAG, "Sensor did not recover after soft reset");
+        return ESP_ERR_NOT_FOUND;
+    }
+
     /* 3) Read the T + P + H1 and H2-H6 calibration blocks */
     err = bme280_read_calibration_tph1();
     if (err != ESP_OK) {
@@ -364,6 +401,10 @@ esp_err_t bme280_init(void)
         return err;
     }
 
+    /* Reset the stuck detection state after a successful init */
+    s_same_raw_count = 0;
+    s_last_valid = false;
+
     ESP_LOGI(TAG, "BME280 initialized (normal mode, T x1, P x1, H x1)");
     return ESP_OK;
 }
@@ -373,6 +414,7 @@ esp_err_t bme280_read(bme280_data_t *out)
     if (out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+
 
     /* Read the 8 raw bytes (0xF7..0xFE) in a single transaction to
      * guarantee they come from the same measurement cycle. */
@@ -403,6 +445,15 @@ esp_err_t bme280_read(bme280_data_t *out)
     out->temperature = (float)T / 100.0f;              /* hundredths -> °C */
     out->pressure    = (float)P / 256.0f / 100.0f;     /* Q24.8 Pa -> hPa */
     out->humidity    = (float)H / 1024.0f;             /* Q24.8 % -> %RH */
+
+    /* Check if the current reading is the same as the last one */
+    if(s_last_valid && memcmp(raw, s_last_raw, sizeof(raw)) == 0) {
+        s_same_raw_count++;
+    } else {
+        s_same_raw_count = 0;
+        memcpy(s_last_raw, raw, sizeof(raw));
+        s_last_valid = true;
+    }
 
     return ESP_OK;
 }

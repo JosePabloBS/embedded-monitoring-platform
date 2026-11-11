@@ -48,7 +48,22 @@ static void sensor_task(void *pvParameters)
     while (1) {
         esp_err_t err = bme280_read(&data);
 
-        if (err != ESP_OK) {
+        if (err == ESP_OK) {
+            /* Check for stuck sensor: I2C works but raw values repeat */
+            if(bme280_is_stuck()) {
+                ESP_LOGE(TAG, "Sensor appears to be stuck at the same raw reading for %d consecutive reads.", BME280_STUCK_THRESHOLD);
+                ESP_LOGW(TAG, "Attempting to re-initialize the sensor...");
+                if(bme280_init() == ESP_OK){
+                    ESP_LOGI(TAG, "Sensor re-initialized successfully");
+                    fail_count = 0; /* Reset failure count on successful re-init */
+                } else {
+                    ESP_LOGE(TAG, "Sensor re-initialization failed");
+                }
+                /* Skip publishing this sample */
+                vTaskDelayUntil(&last_wake, period);
+                continue;
+            }
+
             if(fail_count > 0){
                 ESP_LOGI(TAG, "Sensor recovered after %d consecutive failures", fail_count);
                 fail_count = 0;
@@ -58,7 +73,7 @@ static void sensor_task(void *pvParameters)
                 ESP_LOGW(TAG, "Data queue full, dropping sample");
             }
         }else{
-            fail_count = 0;
+            fail_count++;
 
             /* Escalate log level as failures accumulate, then quiet down */
             if(fail_count <= SENSOR_FAIL_THRESHOLD){
